@@ -17,8 +17,12 @@ let _gamePassCache = null;
 let _gamePassLoadPromise = null;
 
 // ==================== UTILITIES ====================
+function normalize(str) {
+  return str.toLowerCase().replace(/[™®©]/g, '').replace(/\s+/g, ' ').trim();
+}
+
 function fuzzyMatch(haystack, needle) {
-  return haystack.toLowerCase().includes(needle.toLowerCase());
+  return normalize(haystack).includes(normalize(needle));
 }
 
 async function fetchJSON(url, options = {}) {
