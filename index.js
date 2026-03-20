@@ -15,7 +15,6 @@ const server = new Server(
 // ==================== CACHES ====================
 let _gamePassCache = null;
 let _gamePassLoadPromise = null;
-let _geforcenowCache = null;
 
 // ==================== UTILITIES ====================
 function fuzzyMatch(haystack, needle) {
@@ -168,52 +167,66 @@ async function checkGamePass(gameName) {
 }
 
 // ==================== GEFORCE NOW ====================
+// Live search via the real API used by nvidia.com/en-us/geforce-now/games/
+// No auth required — discovered by intercepting browser network requests.
+const GFN_API_URL = 'https://api-prod.nvidia.com/services/gfngames/v1/gameList';
+const GFN_VPC_ID = 'NP-DAL-04'; // US region ID
 
-async function loadGeForceNowCatalog() {
-  if (_geforcenowCache) return _geforcenowCache;
-  const data = await fetchJSON(
-    'https://static.nvidiagrid.net/supported-public-game-list/locales/gfnpc-en-US.json'
-  );
-  _geforcenowCache = Array.isArray(data) ? data : (data.games ?? data.Games ?? []);
-  return _geforcenowCache;
+function buildGfnQuery(searchQuery) {
+  return `{ apps(country:"US" language:"en_US" orderBy:"itemMetadata.relevance:DESC,sortName:ASC" after:"" searchQuery:${JSON.stringify(searchQuery)} vpcId:${JSON.stringify(GFN_VPC_ID)}) {
+    numberReturned
+    pageInfo { endCursor hasNextPage }
+    items {
+      title
+      sortName
+      gfn { playType minimumMembershipTierLabel }
+      variants { appStore publisherName }
+    }
+  }}`;
 }
 
-// Extract Steam app ID from a steamUrl like "https://store.steampowered.com/app/1903340"
-function steamAppIdFromUrl(url) {
-  const m = (url ?? '').match(/\/app\/(\d+)/);
-  return m ? m[1] : null;
+async function searchGeForceNow(gameName) {
+  const res = await fetch(GFN_API_URL, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: buildGfnQuery(gameName),
+  });
+  if (!res.ok) throw new Error(`GFN API HTTP ${res.status}`);
+  const data = await res.json();
+  return data?.data?.apps?.items ?? [];
 }
 
 async function checkGeForceNow(gameName) {
-  const games = await loadGeForceNowCatalog();
-  const getTitle = g => g.title ?? g.Title ?? g.name ?? g.Name ?? '';
-  const matches = games.filter(g => fuzzyMatch(getTitle(g), gameName));
+  const items = await searchGeForceNow(gameName);
   return {
     query: gameName,
-    found: matches.length > 0,
-    matches: matches.slice(0, 5).map(g => ({
-      title: getTitle(g),
-      steamUrl: g.steamUrl ?? g.SteamUrl ?? null,
+    found: items.length > 0,
+    matches: items.slice(0, 5).map(g => ({
+      title: g.title,
+      playType: g.gfn?.playType ?? null,
+      stores: g.variants?.map(v => v.appStore) ?? [],
     })),
-    catalogSize: games.length,
   };
 }
 
 // ==================== UNIFIED CHECK ====================
 
 async function checkGameEverywhere(gameName) {
-  // First get Steam results and pre-load the catalogs in parallel
-  const [steamRes, gpCatalogRes, gfnCatalogRes] = await Promise.allSettled([
+  // Load Steam results + Game Pass catalog + GFN search all in parallel
+  const [steamRes, gpCatalogRes, gfnRes] = await Promise.allSettled([
     searchSteam(gameName),
     loadGamePassCatalog(),
-    loadGeForceNowCatalog(),
+    searchGeForceNow(gameName),
   ]);
 
   const steamResults = steamRes.status === 'fulfilled' ? steamRes.value : [];
   const gpCatalog = gpCatalogRes.status === 'fulfilled' ? gpCatalogRes.value : null;
-  const gfnCatalog = gfnCatalogRes.status === 'fulfilled' ? gfnCatalogRes.value : null;
+  const gfnItems = gfnRes.status === 'fulfilled' ? gfnRes.value : null;
 
-  const getTitle = g => g.title ?? g.Title ?? g.name ?? g.Name ?? '';
+  // Build a Set of GFN titles (lowercased) for fast matching against Steam results
+  const gfnTitleSet = gfnItems
+    ? new Set(gfnItems.map(g => g.title.toLowerCase()))
+    : null;
 
   // For each Steam result, check Game Pass and GeForce Now
   const games = steamResults.map(game => {
@@ -221,26 +234,11 @@ async function checkGameEverywhere(gameName) {
       ? gpCatalog.filter(g => fuzzyMatch(g.name, game.name))
       : null;
 
-    // GFN: match by Steam app ID first (reliable), fall back to title fuzzy match.
-    // If no match found, return 'unknown' — the catalog (last updated 2022) may be missing
-    // newer titles. 'no' would be a false negative for recently added games.
-    let gfnMatch = null;
-    if (gfnCatalog) {
-      const appIdStr = String(game.appid);
-      gfnMatch = gfnCatalog.filter(g => {
-        const gfnAppId = steamAppIdFromUrl(g.steamUrl ?? g.SteamUrl ?? '');
-        return gfnAppId === appIdStr || fuzzyMatch(getTitle(g), game.name);
-      });
-    }
-
-    const onGamePass = gpMatch ? gpMatch.length > 0 : null;
-    // Only report 'no' if we found it in the catalog and it wasn't there.
-    // If catalog is available but no match, return 'unknown' since catalog may be stale.
-    const geforceNowStatus = gfnCatalog === null
-      ? 'unknown'
-      : gfnMatch.length > 0
-        ? 'yes'
-        : 'unknown (not in catalog — verify at nvidia.com/geforce-now/games)';
+    // GFN: match the live search results against this Steam title
+    const onGeForceNow = gfnTitleSet === null
+      ? null
+      : gfnTitleSet.has(game.name.toLowerCase()) ||
+        gfnItems.some(g => fuzzyMatch(g.title, game.name) || fuzzyMatch(game.name, g.title));
 
     return {
       name: game.name,
@@ -248,8 +246,8 @@ async function checkGameEverywhere(gameName) {
       steamDiscount: game.discount,
       onSale: game.onSale,
       originalPrice: game.originalPrice,
-      gamePass: onGamePass === null ? 'unknown' : onGamePass ? 'yes' : 'no',
-      geforceNow: geforceNowStatus,
+      gamePass: gpMatch === null ? 'unknown' : gpMatch.length > 0 ? 'yes' : 'no',
+      geforceNow: onGeForceNow === null ? 'unknown' : onGeForceNow ? 'yes' : 'no',
       steamDeck: game.steamDeck,
       macOS: game.macOS,
       url: game.url,
@@ -259,7 +257,7 @@ async function checkGameEverywhere(gameName) {
   const anyOnGamePass = games.some(g => g.gamePass === 'yes');
   const catalogErrors = {
     gamePass: gpCatalogRes.status === 'rejected' ? gpCatalogRes.reason?.message : null,
-    geforceNow: gfnCatalogRes.status === 'rejected' ? gfnCatalogRes.reason?.message : null,
+    geforceNow: gfnRes.status === 'rejected' ? gfnRes.reason?.message : null,
   };
 
   return {
